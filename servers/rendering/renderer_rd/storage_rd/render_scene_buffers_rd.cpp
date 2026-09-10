@@ -738,6 +738,19 @@ void RenderSceneBuffersRD::ensure_velocity() {
 	}
 }
 
+void RenderSceneBuffersRD::ensure_mobile_velocity(bool p_separate_depth) {
+	if (!has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY)) {
+		// Separate opaque pass, at internal resolution, independent of scene MSAA.
+		// XYZ are current-minus-previous OpenXR-style NDC; A marks surface coverage.
+		create_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY, RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT);
+	}
+	if (p_separate_depth && !has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_DEPTH)) {
+		create_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_DEPTH, get_depth_format(false, false, false),
+				get_depth_usage_bits(false, false, false), RD::TEXTURE_SAMPLES_1, Size2i(), 0, 1, true, true);
+	}
+}
+
 bool RenderSceneBuffersRD::has_velocity_buffer(bool p_has_msaa) {
 	if (p_has_msaa) {
 		return has_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY_MSAA);
@@ -747,7 +760,7 @@ bool RenderSceneBuffersRD::has_velocity_buffer(bool p_has_msaa) {
 		if (velocity.is_valid()) {
 			return true;
 		} else {
-			return has_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY);
+			return has_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY) || has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY);
 		}
 	}
 }
@@ -764,6 +777,8 @@ RID RenderSceneBuffersRD::get_velocity_buffer(bool p_get_msaa) {
 		RID velocity = texture_storage->render_target_get_override_velocity(render_target);
 		if (velocity.is_valid()) {
 			return velocity;
+		} else if (has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY)) {
+			return get_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY);
 		} else if (!has_texture(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY)) {
 			return RID();
 		} else {
@@ -780,6 +795,8 @@ RID RenderSceneBuffersRD::get_velocity_buffer(bool p_get_msaa, uint32_t p_layer)
 		RID velocity_slice = texture_storage->render_target_get_override_velocity_slice(render_target, p_layer);
 		if (velocity_slice.is_valid()) {
 			return velocity_slice;
+		} else if (has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY)) {
+			return get_texture_slice(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY, p_layer, 0);
 		} else {
 			return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_VELOCITY, p_layer, 0);
 		}
@@ -789,7 +806,10 @@ RID RenderSceneBuffersRD::get_velocity_buffer(bool p_get_msaa, uint32_t p_layer)
 RID RenderSceneBuffersRD::get_velocity_depth_buffer() {
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 	RID velocity_depth = texture_storage->render_target_get_override_velocity_depth(render_target);
-	return velocity_depth;
+	if (velocity_depth.is_valid()) {
+		return velocity_depth;
+	}
+	return has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_DEPTH) ? get_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_DEPTH) : RID();
 }
 
 uint32_t RenderSceneBuffersRD::get_color_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {

@@ -1022,6 +1022,9 @@ layout(location = 1) out vec4 specular_buffer; //specular and SSS (subsurface sc
 #else
 
 layout(location = 0) out vec4 frag_color;
+#ifdef MOTION_VECTORS_MRT
+layout(location = 1) out vec4 frag_velocity;
+#endif
 #endif // MODE_MULTIPLE_RENDER_TARGETS
 
 #endif // RENDER DEPTH
@@ -2394,6 +2397,15 @@ void main() {
 	ndc.y = -ndc.y;
 	vec3 prev_ndc = prev_screen_position.xyz / prev_screen_position.w;
 	prev_ndc.y = -prev_ndc.y;
+#ifdef COMPOSITOR_MOTION_VECTORS
+	// Alpha differentiates uncovered background from a stationary surface.
+#ifdef MOTION_VECTORS_MRT
+	frag_velocity = vec4(ndc - prev_ndc, 1.0);
+#else
+	frag_color = vec4(ndc - prev_ndc, 1.0);
+#endif
+#else
 	frag_color = vec4(ndc - prev_ndc, 0.0);
+#endif
 #endif
 }

@@ -271,10 +271,17 @@ RID RenderForwardMobile::RenderBufferDataForwardMobile::get_color_fbs(Framebuffe
 	Vector<RD::FramebufferPass> passes;
 
 	switch (p_config_type) {
+		case FB_CONFIG_RENDER_PASS_MOTION_VECTORS:
 		case FB_CONFIG_RENDER_PASS: {
 			RD::FramebufferPass pass;
 			pass.color_attachments.push_back(0);
 			pass.depth_attachment = 1;
+
+			if (p_config_type == FB_CONFIG_RENDER_PASS_MOTION_VECTORS) {
+				ERR_FAIL_COND_V(use_msaa || view_count != 1, RID());
+				pass.color_attachments.push_back(textures.size());
+				textures.push_back(render_buffers->get_velocity_buffer(false));
+			}
 
 			if (use_msaa) {
 				// Add color resolve.
@@ -862,6 +869,26 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 		p_render_data->scene_data->calculate_motion_vectors = false;
 	}
 
+	// Ordinary compositor viewports need owned targets; XR continues using its overrides.
+	const bool ce_needs_motion_vectors = !is_reflection_probe && rb_data.is_valid() &&
+			_compositor_effects_has_flag(p_render_data, RSE::COMPOSITOR_EFFECT_FLAG_NEEDS_MOTION_VECTORS);
+	// Fused color+velocity avoids a second geometry pass on the game's main path.
+	// Sky/canvas/XR/MSAA retain the isolated pass until their MRT variants exist.
+	const bool color_background = p_render_data->environment.is_null() ||
+			environment_get_background(p_render_data->environment) == RSE::ENV_BG_CLEAR_COLOR ||
+			environment_get_background(p_render_data->environment) == RSE::ENV_BG_COLOR;
+	const bool motion_vectors_mrt = ce_needs_motion_vectors && !p_render_data->scene_data->calculate_motion_vectors &&
+			rb->get_view_count() == 1 && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED && color_background &&
+			get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_DISABLED &&
+			(p_render_data->environment.is_null() || !environment_get_fog_enabled(p_render_data->environment)) &&
+			bool(GLOBAL_GET("rendering/renderer/mobile_motion_vectors_mrt"));
+	if (ce_needs_motion_vectors && !p_render_data->scene_data->calculate_motion_vectors) {
+		rb->ensure_mobile_velocity(!motion_vectors_mrt);
+		p_render_data->scene_data->calculate_motion_vectors = true;
+	} else if (rb->has_texture(RB_SCOPE_MOBILE_VELOCITY, RB_TEX_VELOCITY)) {
+		rb->clear_context(RB_SCOPE_MOBILE_VELOCITY);
+	}
+
 	p_render_data->scene_data->directional_light_count = 0;
 	p_render_data->scene_data->opaque_prepass_threshold = 0.0;
 
@@ -894,7 +921,7 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 	}
 
 	// Using RenderingEffects limits our ability to do subpasses..
-	if (ce_has_pre_transparent) {
+	if (ce_has_pre_transparent || motion_vectors_mrt) {
 		merge_transparent_pass = false;
 		using_subpass_post_process = false;
 	}
@@ -1005,7 +1032,7 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 			global_pipeline_data_required.use_subpass_post_pass = true;
 		} else {
 			// We separate things out.
-			framebuffer = rb_data->get_color_fbs(RenderBufferDataForwardMobile::FB_CONFIG_RENDER_PASS, resolve_depth_buffer && supports_depth_resolve);
+			framebuffer = rb_data->get_color_fbs(motion_vectors_mrt ? RenderBufferDataForwardMobile::FB_CONFIG_RENDER_PASS_MOTION_VECTORS : RenderBufferDataForwardMobile::FB_CONFIG_RENDER_PASS, resolve_depth_buffer && supports_depth_resolve);
 			global_pipeline_data_required.use_separate_post_pass = true;
 		}
 		samplers = rb->get_samplers();
@@ -1192,7 +1219,7 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 			breadcrumb = RDD::BreadcrumbMarker::REFLECTION_PROBES;
 		}
 
-		if (rb_data.is_valid() && p_render_data->scene_data->calculate_motion_vectors) {
+		if (rb_data.is_valid() && p_render_data->scene_data->calculate_motion_vectors && !motion_vectors_mrt) {
 			RID mv_fb = rb_data->get_motion_vectors_fb();
 
 			if (mv_fb.is_valid()) {
@@ -1205,6 +1232,7 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 
 				RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, RID(), samplers);
 				RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_MOTION_VECTORS, rp_uniform_set, base_specialization);
+				render_list_params.view_count = rb->get_view_count();
 				_render_list_with_draw_list(&render_list_params, mv_fb, RD::DRAW_CLEAR_ALL, mv_pass_clear);
 
 				RD::get_singleton()->draw_command_end_label();
@@ -1250,7 +1278,13 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 			}
 		}
 
-		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(framebuffer, load_color ? RD::DRAW_CLEAR_DEPTH : (RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_DEPTH), c, 0.0f, 0, p_render_data->render_region, breadcrumb);
+		uint32_t clear_flags = load_color ? RD::DRAW_CLEAR_DEPTH : (RD::DRAW_CLEAR_COLOR_0 | RD::DRAW_CLEAR_DEPTH);
+		if (motion_vectors_mrt) {
+			c.resize(2);
+			c.write[1] = Color(0, 0, 0, 0);
+			clear_flags |= RD::DRAW_CLEAR_COLOR_1;
+		}
+		RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(framebuffer, clear_flags, c, 0.0f, 0, p_render_data->render_region, breadcrumb);
 		RD::FramebufferFormatID fb_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
 
 		if (copy_canvas) {
@@ -1266,6 +1300,7 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 
 		if (render_list[RENDER_LIST_OPAQUE].elements.size() > 0) {
 			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_COLOR, rp_uniform_set, base_specialization, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count);
+			render_list_params.motion_vectors_mrt = motion_vectors_mrt;
 			render_list_params.framebuffer_format = fb_format;
 			render_list_params.subpass = RD::get_singleton()->draw_list_get_current_pass(); // Should now always be 0.
 
@@ -1352,6 +1387,12 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 				}
 			}
 
+			if (motion_vectors_mrt) {
+				// TAA has consumed opaque velocity. Late hulls must neither overwrite
+				// it nor require the opaque two-target pipeline layout.
+				framebuffer = rb_data->get_color_fbs(RenderBufferDataForwardMobile::FB_CONFIG_RENDER_PASS);
+				fb_format = RD::get_singleton()->framebuffer_get_format(framebuffer);
+			}
 			if (render_list[RENDER_LIST_ALPHA].element_info.size() > 0) {
 				RD::get_singleton()->draw_command_begin_label("Render Transparent Pass");
 				RENDER_TIMESTAMP("Render Transparent");
@@ -2531,9 +2572,9 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 			case PASS_MODE_COLOR:
 			case PASS_MODE_COLOR_TRANSPARENT: {
 				if (element_info.uses_lightmap) {
-					pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS;
+					pipeline_key.version = p_params->motion_vectors_mrt ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MOTION_VECTORS : (p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_LIGHTMAP_COLOR_PASS);
 				} else {
-					pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS;
+					pipeline_key.version = p_params->motion_vectors_mrt ? SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS_MOTION_VECTORS : (p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_COLOR_PASS);
 				}
 			} break;
 			case PASS_MODE_SHADOW: {
@@ -2548,7 +2589,7 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL;
 			} break;
 			case PASS_MODE_MOTION_VECTORS: {
-				pipeline_key.version = SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS_MULTIVIEW;
+				pipeline_key.version = p_params->view_count > 1 ? SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS_MULTIVIEW : SceneShaderForwardMobile::SHADER_VERSION_MOTION_VECTORS;
 			}
 		}
 
@@ -2570,9 +2611,9 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 			// Skeleton and blend shape.
 			uint64_t input_mask = shader->get_vertex_input_mask(pipeline_key.version, pipeline_key.ubershader);
 			if (surf->owner->mesh_instance.is_valid()) {
-				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, p_pass_mode == PASS_MODE_MOTION_VECTORS, emulate_point_size, vertex_array_rd, vertex_format);
+				mesh_storage->mesh_instance_surface_get_vertex_arrays_and_format(surf->owner->mesh_instance, surf->surface_index, input_mask, (p_pass_mode == PASS_MODE_MOTION_VECTORS || p_params->motion_vectors_mrt), emulate_point_size, vertex_array_rd, vertex_format);
 			} else {
-				mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, p_pass_mode == PASS_MODE_MOTION_VECTORS, emulate_point_size, vertex_array_rd, vertex_format);
+				mesh_storage->mesh_surface_get_vertex_arrays_and_format(mesh_surface, input_mask, (p_pass_mode == PASS_MODE_MOTION_VECTORS || p_params->motion_vectors_mrt), emulate_point_size, vertex_array_rd, vertex_format);
 			}
 
 			pipeline_key.vertex_format_id = vertex_format;
@@ -3555,6 +3596,7 @@ void RenderForwardMobile::_update_shader_quality_settings() {
 }
 
 RenderForwardMobile::RenderForwardMobile() {
+	GLOBAL_DEF("rendering/renderer/mobile_motion_vectors_mrt", true);
 	singleton = this;
 
 	disable_ubershaders = RD::get_singleton()->get_driver_workarounds().disable_ubershaders;

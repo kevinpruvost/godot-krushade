@@ -82,6 +82,7 @@ private:
 
 	public:
 		enum FramebufferConfigType {
+			FB_CONFIG_RENDER_PASS_MOTION_VECTORS, // Opaque color + velocity MRT, no MSAA.
 			FB_CONFIG_RENDER_PASS, // Single pass framebuffer for normal rendering.
 			FB_CONFIG_RENDER_AND_POST_PASS, // Two subpasses, one for normal rendering, one for post processing.
 			FB_CONFIG_MAX
@@ -123,6 +124,7 @@ private:
 	struct RenderElementInfo;
 
 	struct RenderListParameters {
+		bool motion_vectors_mrt = false;
 		GeometryInstanceSurfaceDataCache **elements = nullptr;
 		RenderElementInfo *element_info = nullptr;
 		int element_count = 0;

@@ -43,6 +43,8 @@
 
 #define RB_SCOPE_BUFFERS SNAME("render_buffers")
 #define RB_SCOPE_VRS SNAME("VRS")
+// Separate lifetime: releasing compositor velocity must not release scene color/depth.
+#define RB_SCOPE_MOBILE_VELOCITY SNAME("mobile_compositor_velocity")
 
 #define RB_TEXTURE SNAME("texture")
 #define RB_TEX_COLOR SNAME("color")
@@ -319,6 +321,7 @@ public:
 	// Velocity, currently only used by TAA (Clustered) but we'll be using this in other places soon too.
 
 	void ensure_velocity();
+	void ensure_mobile_velocity(bool p_separate_depth);
 	bool has_velocity_buffer(bool p_has_msaa);
 	RID get_velocity_buffer(bool p_get_msaa);
 	RID get_velocity_buffer(bool p_get_msaa, uint32_t p_layer);
